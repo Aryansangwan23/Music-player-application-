@@ -1,14 +1,37 @@
 # pyrefly: ignore [missing-import]
-from flask import Flask, jsonify, request
-from flask_cors import CORS
-import yt_dlp
+"""
+ListenUp Flask API & Media Streaming Server
+===========================================
+This module serves as the primary backend server for the ListenUp music player application.
+
+Key Capabilities:
+  1. Static Asset Delivery: Serves React SPA production builds with deep-linking support.
+  2. Audio Streaming: Extracts direct, high-bitrate audio streams from YouTube via yt-dlp.
+  3. Search & Browsing: Implements flat YouTube search and category browsing with TTL caching.
+  4. Artist Discovery Proxy: Proxies search requests to the public Deezer API with image sanitization,
+     data normalization, and in-memory LRU-style eviction caching.
+  5. User Data Persistence: Integrates SQLite for custom playlists, favorites, and user preferences.
+  6. Explainable Recommendations: Powers hybrid music recommendations, listening event tracking,
+     and next-track autoplay generation.
+"""
+
+from __future__ import annotations
+
 import logging
 import os
 import random
 import string
-from datetime import datetime
+import sys
 import time
+import time as _time
+from datetime import datetime
+from typing import Any, Dict, List, Optional, Tuple, Union
+
 import requests
+import yt_dlp
+from flask import Flask, jsonify, request
+from flask_cors import CORS
+
 from auth import require_auth, verify_supabase_token
 import user_db
 from recommender import (
@@ -19,36 +42,72 @@ from recommender import (
     upsert_user_song_stats,
 )
 
-# Set up static folder pointing to the React production build if it exists
-base_dir = os.path.dirname(os.path.abspath(__file__))
-dist_folder = os.path.join(base_dir, '..', 'listenup-web', 'dist')
+# ─── Static Directory Resolution for Single-Page Application (SPA) ───────────
+# Resolves the production build directory from listenup-web/dist if present,
+# falling back to local static folder.
+base_dir: str = os.path.dirname(os.path.abspath(__file__))
+dist_folder: str = os.path.join(base_dir, '..', 'listenup-web', 'dist')
 if not os.path.exists(dist_folder):
     dist_folder = os.path.join(base_dir, 'static')
 
-import sys
-
+# Initialize Flask application with custom static folder
 app = Flask(__name__, static_folder=dist_folder, static_url_path='')
-CORS(app)  # Enable CORS for clients
+CORS(app)  # Enable Cross-Origin Resource Sharing for web & mobile clients
 
+# Configure server logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#   CORE APPLICATION & HEALTH CHECK ROUTES
+# ═══════════════════════════════════════════════════════════════════════════════
+
 @app.route('/')
-def index():
-    """Serve the React frontend in production (SPA deep-link support)"""
+def index() -> Any:
+    """
+    Serve the production React frontend Single-Page Application (SPA).
+
+    Returns:
+        Response: HTML content of index.html if built, or informational plain text.
+    """
     try:
         return app.send_static_file('index.html')
     except Exception:
         return "ListenUp Web: Run 'npm run build' inside listenup-web to build the frontend.", 200
 
+
 @app.route('/health', methods=['GET'])
-def health():
-    """Health check endpoint"""
+def health() -> Any:
+    """
+    Health check endpoint for container orchestrators and monitoring probes.
+
+    Returns:
+        JSON response with service status and name.
+    """
     return jsonify({"status": "ok", "service": "yt-dlp-server"})
 
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#   YOUTUBE SEARCH & BROWSE ENDPOINTS
+# ═══════════════════════════════════════════════════════════════════════════════
+
 @app.route('/api/search', methods=['GET'])
-def search():
-    """Search YouTube for videos/songs using yt-dlp flat extraction"""
+def search() -> Any:
+    """
+    Search YouTube for music tracks using yt-dlp flat extraction.
+
+    Query Parameters:
+        q (str): Search term / query string.
+
+    Filtering & Sanitation:
+        - Drops shorts (<60 seconds) and ultra-long mixes (>600 seconds).
+        - Extracts high-resolution thumbnail fallback chains.
+        - Limits output to top 20 relevant items.
+
+    Returns:
+        JSON array of song dictionaries: [{id, title, artist, thumbnailUrl, duration, viewCount}, ...]
+    """
     query = request.args.get('q', '')
     if not query:
         return jsonify([])
@@ -103,12 +162,13 @@ def search():
         logger.error(f"Search error for query '{query}': {str(e)}")
         return jsonify({"error": str(e)}), 500
 
-# Simple in-memory cache for browse results (avoids hammering yt-dlp on page load)
-import time as _time
-_browse_cache = {}
-_CACHE_TTL = 600  # 10 minutes
 
-BROWSE_CATEGORIES = {
+# In-memory browse cache: stores pre-fetched category queries to avoid excessive yt-dlp queries
+_browse_cache: Dict[str, Tuple[List[Dict[str, Any]], float]] = {}
+_CACHE_TTL: int = 600  # 10 minutes cache validity
+
+# Predefined curated browse queries for popular music genres and moods
+BROWSE_CATEGORIES: Dict[str, str] = {
     "trending": "latest trending hit songs india official music video",
     "sad": "sad emotional heartbreak songs hindi official video",
     "bollywood": "latest bollywood songs official video",
@@ -119,15 +179,25 @@ BROWSE_CATEGORIES = {
     "party": "party dance songs hindi official video"
 }
 
+
 @app.route('/api/browse', methods=['GET'])
-def browse():
-    """Return curated songs for a category using predefined searches"""
+def browse() -> Any:
+    """
+    Return curated songs for a predefined music category.
+
+    Query Parameters:
+        category (str): Category key (e.g. 'trending', 'bollywood', 'lofi').
+                        Defaults to 'trending'.
+
+    Returns:
+        JSON array of top 20 curated tracks for the category.
+    """
     category = request.args.get('category', 'trending').lower()
 
     if category not in BROWSE_CATEGORIES:
         return jsonify({"error": f"Unknown category: {category}", "available": list(BROWSE_CATEGORIES.keys())}), 400
 
-    # Check cache
+    # Check in-memory TTL browse cache
     cache_key = category
     now = _time.time()
     if cache_key in _browse_cache:
@@ -186,25 +256,37 @@ def browse():
         logger.error(f"Browse error for category '{category}': {str(e)}")
         return jsonify({"error": str(e)}), 500
 
+
 @app.route('/api/categories', methods=['GET'])
-def categories():
-    """Return the list of available browse categories"""
+def categories() -> Any:
+    """
+    List all supported browse category slugs.
+
+    Returns:
+        JSON list of string category keys.
+    """
     return jsonify(list(BROWSE_CATEGORIES.keys()))
 
-# Initialize user database
+
+# ── Initialize Local Persistent SQLite Database ──────────────────────────────
 try:
     user_db.init_db()
     logger.info("Initialized local persistent user database (user_data.db)")
 except Exception as _db_init_err:
     logger.warning("Failed initializing user_db: %s", _db_init_err)
 
-# ── Deezer Artist Discovery Configuration & In-Memory Cache ──────────────────
-_ARTIST_SEARCH_CACHE: dict[str, tuple[float, dict]] = {}
-_ARTIST_CACHE_TTL = 900.0  # 15 minutes TTL
-_ARTIST_CACHE_MAX = 300
 
-# Authentic popular artist discovery seeds - starting with the exact 10 artists from the design image
-DEFAULT_DISCOVERY_ARTIST_NAMES = [
+# ═══════════════════════════════════════════════════════════════════════════════
+#   DEEZER ARTIST DISCOVERY PROXY & NORMALIZATION
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# In-memory artist search cache with max-size eviction control
+_ARTIST_SEARCH_CACHE: dict[str, tuple[float, dict]] = {}
+_ARTIST_CACHE_TTL: float = 900.0  # 15 minutes TTL
+_ARTIST_CACHE_MAX: int = 300
+
+# Curated popular artist discovery seeds for initial onboarding & exploration
+DEFAULT_DISCOVERY_ARTIST_NAMES: List[str] = [
     "Arijit Singh",
     "Pritam",
     "Vishal Mishra",
@@ -227,8 +309,20 @@ DEFAULT_DISCOVERY_ARTIST_NAMES = [
     "Ed Sheeran"
 ]
 
+
 def _clean_artist_image(url: str | None) -> str | None:
-    """Sanitize Deezer image URLs and filter out Deezer's blank placeholder hashes."""
+    """
+    Sanitize artist image URLs from Deezer and filter out placeholder blank hashes.
+
+    Deezer returns an empty hash with double-slash like '/images/artist//250x250...'
+    when no official artist photograph is uploaded.
+
+    Args:
+        url: Raw image URL from Deezer API.
+
+    Returns:
+        str | None: Cleaned valid URL or None if placeholder/invalid.
+    """
     if not url or not isinstance(url, str):
         return None
     url = url.strip()
@@ -239,8 +333,18 @@ def _clean_artist_image(url: str | None) -> str | None:
         return None
     return url
 
+
 def _normalize_deezer_artist(raw: dict) -> dict:
-    """Normalize Deezer API artist payload into ListenUp's canonical contract."""
+    """
+    Normalize Deezer API artist payload into ListenUp's canonical artist contract.
+
+    Args:
+        raw: Raw artist dict returned from Deezer API.
+
+    Returns:
+        dict: Normalized artist object {id, name, image, imageMedium, imageLarge,
+              deezerUrl, provider, fanCount, albumCount}.
+    """
     artist_id = str(raw.get("id") or "")
     name = (raw.get("name") or "Unknown Artist").strip()
     picture_small = _clean_artist_image(raw.get("picture_small") or raw.get("picture"))
@@ -265,14 +369,19 @@ def _normalize_deezer_artist(raw: dict) -> dict:
         "albumCount": album_count,
     }
 
+
 @app.route('/api/artists/search', methods=['GET'])
-def search_artists():
+def search_artists() -> Any:
     """
     Search music artists via Deezer public API proxy.
-    Query parameters:
-        q: Artist name or query (e.g. 'arijit'). If empty or missing, returns curated popular discovery artists.
-        limit: Max results to return (default 20, min 1, max 50).
-        index: Pagination offset index (default 0, min 0).
+
+    Query Parameters:
+        q (str): Artist name or query. If empty or missing, returns curated popular discovery artists.
+        limit (int): Max results to return (default 20, clamped between 1 and 50).
+        index (int): Pagination offset index (default 0, min 0).
+
+    Returns:
+        JSON object: {artists, total, hasMore, nextIndex, provider, query}
     """
     query = (request.args.get('q') or '').strip()
     try:
@@ -410,12 +519,27 @@ def search_artists():
             "error": "Failed to search artists"
         }), 500
 
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#   AUDIO STREAM EXTRACTION (yt-dlp)
+# ═══════════════════════════════════════════════════════════════════════════════
+
 @app.route('/stream/<video_id>', methods=['GET'])
 @app.route('/api/stream/<video_id>', methods=['GET'])
-def get_stream(video_id):
+def get_stream(video_id: str) -> Any:
     """
-    Extract audio stream URL for a YouTube video
-    Returns JSON with stream URL and metadata
+    Extract direct audio stream URL and playback metadata for a YouTube video.
+
+    Process:
+      1. Resolves video info with format preference 'bestaudio/best'.
+      2. Selects pure audio streams (vcodec='none', acodec!='none') with highest bitrate.
+      3. Returns stream URL, audio format, and bitrate quality indicator.
+
+    Path Parameter:
+        video_id: YouTube 11-character video ID.
+
+    Returns:
+        JSON object: {video_id, stream_url, title, duration, format, quality}
     """
     try:
         logger.info(f"Extracting stream for video: {video_id}")
@@ -468,6 +592,9 @@ def get_stream(video_id):
     except Exception as e:
         logger.error(f"Error extracting stream for {video_id}: {str(e)}")
         return jsonify({"error": str(e)}), 500
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 
 # ─── Authenticated & Personalized Recommendation Endpoints ──────────
 
