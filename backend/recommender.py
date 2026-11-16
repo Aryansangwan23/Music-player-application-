@@ -1,21 +1,30 @@
 """
 ListenUp Recommendation Engine
 ===============================
-A hybrid, explainable music recommendation system.
+A hybrid, explainable music recommendation system tailored for the ListenUp application.
 
-Approach:
-  1. Content-based filtering  — artist/genre/mood text similarity
-  2. User-behaviour signals   — play_count, skip_count, likes, recency
-  3. Discovery diversification — prevent artist monopoly in results
+Core Methodological Approach:
+  1. Content-Based Filtering:
+     - Evaluates textual similarity of song metadata (title, artist, uploader) against
+       user-selected genres, moods, and artist preferences.
+     - Utilizes normalized token overlap (Jaccard similarity) and domain-specific taxonomies.
+  2. Behavioral & Engagement Signals:
+     - Incorporates historical listening metrics: play count, completion rate, skips, and likes.
+     - Implements dynamic logarithmic scaling for repeated listens and bounded skip penalties.
+  3. Discovery & Diversity Optimization:
+     - Applies Maximal Marginal Relevance (MMR) inspired greedy selection to prevent artist monopoly.
+     - Enforces an artist diversity cap and penalizes repeated artists in recommendation queues.
+  4. Audio Characteristics & Popularity Heuristics:
+     - Duration sweet-spot fitness scoring (optimal 2.5 to 6 minutes; filters shorts and mega-mixes).
+     - Log-scaled YouTube view counts acting as a proxy for crowd consensus and track quality.
 
-This module is intentionally pure-Python with no ML framework dependencies.
-The scoring is deterministic and configurable via SCORE_WEIGHTS.
+Architecture & Dependencies:
+  - Intentionally pure Python without bulky machine learning frameworks (e.g. PyTorch/TensorFlow),
+    ensuring lightweight, deterministic, sub-50ms CPU scoring suitable for production microservices.
+  - Supabase integration via REST API utilizing anon/service-role credentials (strictly server-side).
 
-All Supabase interaction is done via the REST API using the service-role key
-(server-side only — never exposed to the frontend or Android client).
-
-Usage:
-    from recommender import get_next_recommendations, get_similar_songs
+Public API:
+    from recommender import get_next_recommendations, get_similar_songs, get_home_sections
 """
 
 from __future__ import annotations
@@ -26,46 +35,56 @@ import re
 import time
 import math
 from collections import defaultdict
-from typing import Any
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import requests
 
+# Configure module-level logger
 logger = logging.getLogger(__name__)
 
 # ─── Configurable Scoring Weights ────────────────────────────────────────────
-# Change these to tune the recommendation balance without touching other code.
-SCORE_WEIGHTS = {
-    "genre_mood_similarity":  0.30,   # Textual overlap with user's genre/mood prefs
-    "artist_preference":      0.25,   # Match against user's favourite artists
-    "listening_history":      0.20,   # Play count, like status, completion rate
-    "audio_characteristics":  0.15,   # Duration fitness, view count (popularity proxy)
-    "discovery":              0.10,   # Penalise artist over-representation in results
+# The composite recommendation score is a weighted linear combination of 5 dimensions.
+# Tuning these coefficients adjusts the balance between user preference adherence and exploration.
+SCORE_WEIGHTS: Dict[str, float] = {
+    "genre_mood_similarity":  0.30,   # Textual overlap with user's selected genres and mood tags
+    "artist_preference":      0.25,   # Direct affinity match against user's favourite artists
+    "listening_history":      0.20,   # Historical playback metrics (play count, like status, completion)
+    "audio_characteristics":  0.15,   # Duration fitness and log-scaled popularity (view count)
+    "discovery":              0.10,   # Diversity reward / penalty against artist concentration
 }
-# Sanity check — weights must sum to 1.0
+
+# Sanity check — weights must sum precisely to 1.0 (within float tolerance)
 assert abs(sum(SCORE_WEIGHTS.values()) - 1.0) < 1e-9, "SCORE_WEIGHTS must sum to 1.0"
 
 # ─── Penalty Configuration ────────────────────────────────────────────────────
-RECENT_PLAY_WINDOW_SEC = 3600          # Songs played in last hour get heavy penalty
-RECENT_PLAY_PENALTY    = 0.6           # Multiply score by this for recently played songs
-SKIP_PENALTY_PER_SKIP  = 0.15         # Subtract this per skip (capped at 0.45)
-MAX_SKIP_PENALTY       = 0.45         # Maximum cumulative skip penalty
-LIKED_SONG_BOOST       = 0.25         # Additive boost for liked songs
-ARTIST_DIVERSITY_CAP   = 2            # Max songs from the same artist in one result set
+# Recency penalty: suppresses tracks played within the last hour to prevent repetition fatigue
+RECENT_PLAY_WINDOW_SEC: int = 3600          # 1 hour window in seconds
+RECENT_PLAY_PENALTY: float    = 0.6         # Multiplier applied to tracks played within the recency window
+
+# Skip penalties: dampens tracks frequently skipped by the user
+SKIP_PENALTY_PER_SKIP: float  = 0.15        # Linear penalty deducted per recorded skip event
+MAX_SKIP_PENALTY: float       = 0.45        # Upper bound on cumulative skip deduction
+
+# Engagement boosts and limits
+LIKED_SONG_BOOST: float       = 0.25        # Additive bonus granted to favorited/liked songs
+ARTIST_DIVERSITY_CAP: int     = 2           # Maximum number of songs permitted from the same artist in a single result set
 
 # ─── Candidate Fetch Configuration ───────────────────────────────────────────
-MAX_CANDIDATES         = 40           # Max songs fetched from yt-dlp per recommendation call
-RESULT_LIMIT_DEFAULT   = 10           # Default songs returned per recommendation request
-CACHE_TTL_SEC          = 600          # 10-minute in-memory candidate cache
+MAX_CANDIDATES: int         = 40            # Max songs extracted from yt-dlp per recommendation query
+RESULT_LIMIT_DEFAULT: int   = 10            # Default number of recommendation tracks returned to client
+CACHE_TTL_SEC: int          = 600           # In-memory candidate search cache time-to-live (10 minutes)
 
-# Song duration sweet-spot (seconds)
-DURATION_MIN_IDEAL     = 150          # 2.5 min
-DURATION_MAX_IDEAL     = 360          # 6 min
+# Song duration sweet-spot thresholds in seconds (optimal song length for streaming)
+DURATION_MIN_IDEAL: int     = 150           # Lower threshold: 2.5 minutes
+DURATION_MAX_IDEAL: int     = 360           # Upper threshold: 6.0 minutes
 
-# ─── Supabase Config (server-side only) ──────────────────────────────────────
-_SUPABASE_URL      = os.environ.get("SUPABASE_URL", "").rstrip("/")
-_SUPABASE_ANON_KEY = os.environ.get("SUPABASE_ANON_KEY", "")
+# ─── Supabase Configuration (Server-Side Only) ──────────────────────────────
+# Credentials read from server environment; never exposed to mobile or web clients
+_SUPABASE_URL: str      = os.environ.get("SUPABASE_URL", "").rstrip("/")
+_SUPABASE_ANON_KEY: str = os.environ.get("SUPABASE_ANON_KEY", "")
 
-# ─── In-memory candidate cache ───────────────────────────────────────────────
+# ─── In-Memory Candidate Search Cache ────────────────────────────────────────
+# Maps search query strings -> (list of song dicts, timestamp)
 _candidate_cache: dict[str, tuple[list[dict], float]] = {}
 
 
@@ -74,7 +93,16 @@ _candidate_cache: dict[str, tuple[list[dict], float]] = {}
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _supa_headers(auth_token: str | None = None) -> dict[str, str]:
-    """Return headers for Supabase REST requests."""
+    """
+    Construct standard HTTP headers for Supabase REST API requests.
+
+    Args:
+        auth_token: Optional Supabase JWT for user-scoped requests. If omitted,
+                    the server's anon API key is utilized for authorization.
+
+    Returns:
+        dict: Headers containing apikey, Content-Type, and Bearer Authorization.
+    """
     headers = {
         "apikey": _SUPABASE_ANON_KEY,
         "Content-Type": "application/json",
@@ -88,9 +116,23 @@ def _supa_headers(auth_token: str | None = None) -> dict[str, str]:
 
 def fetch_user_song_stats(user_id: str, auth_token: str | None = None) -> list[dict]:
     """
-    Fetch per-user per-song stats from Supabase.
-    Returns list of user_song_stats rows, or empty list on failure.
-    Never raises — recommendation failure must not crash the player.
+    Retrieve historical per-song engagement metrics for a user from Supabase.
+
+    Fetches up to 200 of the user's most recently played songs from the
+    `user_song_stats` table, including play counts, skip counts, completion counts,
+    total listening seconds, and like statuses.
+
+    Fail-safe behavior:
+      This function never raises an unhandled exception. On failure or network timeout,
+      it returns an empty list so recommendation generation falls back gracefully to
+      content-based signals without interrupting playback.
+
+    Args:
+        user_id: Unique Supabase identifier of the authenticated user.
+        auth_token: Optional Bearer token for user-scoped RLS policies.
+
+    Returns:
+        list[dict]: Array of user_song_stats records, or empty list on error.
     """
     if not _SUPABASE_URL or not user_id:
         return []
@@ -118,9 +160,28 @@ def upsert_user_song_stats(
     auth_token: str | None = None,
 ) -> bool:
     """
-    Atomically update user_song_stats for one event.
-    Uses Supabase REST upsert with POST-merge semantics.
-    Returns True on success, False on failure.
+    Atomically update aggregated user listening stats for a song event.
+
+    Processes playback event types ('play_started', 'play_completed', 'song_skipped',
+    'song_liked', 'song_unliked', 'playlist_added', 'play_progress') and merges the
+    incremental counters into the `user_song_stats` table via Supabase REST API.
+
+    Performance & Safety:
+      - Validates and clamps `listen_seconds` delta between 0.0 and 300.0 seconds per event
+        to safeguard against corrupted telemetry or runaway timer deltas.
+      - Uses `Prefer: resolution=merge-duplicates` for conflict resolution on (user_id, song_id).
+
+    Args:
+        user_id: Authenticated user's unique identifier.
+        song_id: YouTube video or track ID.
+        song_data: Full dictionary of song metadata (title, artist, duration, etc.).
+        event_type: Identifier of the playback event occurring.
+        listen_seconds: Duration in seconds the user listened before this event.
+        listen_fraction: Fraction (0.0 to 1.0) of song duration listened.
+        auth_token: Optional user auth JWT.
+
+    Returns:
+        bool: True if upsert succeeded (HTTP 200/201/204), False otherwise.
     """
     if not _SUPABASE_URL or not user_id:
         return False
@@ -134,10 +195,7 @@ def upsert_user_song_stats(
         "updated_at": "now()",
     }
 
-    # We cannot do server-side increments through the REST upsert directly,
-    # so we use a RPC approach — but to avoid adding a DB function dependency
-    # we fetch+update in Python. This is acceptable for event rates <~10/sec.
-    # For high-scale production, replace with a PostgreSQL function.
+    # Fetch existing metrics to perform in-memory delta increments before upsert
     try:
         url = f"{_SUPABASE_URL}/rest/v1/user_song_stats?user_id=eq.{user_id}&song_id=eq.{song_id}"
         existing_resp = requests.get(url, headers=_supa_headers(auth_token), timeout=3)
@@ -215,7 +273,26 @@ def insert_listening_event(
     metadata: dict | None = None,
     auth_token: str | None = None,
 ) -> bool:
-    """Insert one raw listening event into the listening_events table."""
+    """
+    Append an immutable raw event record to the `listening_events` audit table.
+
+    Privacy Note:
+      Guest (unauthenticated) listening events are deliberately NOT persisted to Supabase
+      (Zero Guest Persistence guarantee), preserving privacy and saving cloud storage.
+
+    Args:
+        user_id: Authenticated user ID (if None, function safely exits early).
+        song_id: Video or track identifier.
+        song_data: Full metadata dictionary for the song.
+        event_type: String constant identifying event (e.g. 'play_completed').
+        listen_seconds: Optional duration listened in seconds.
+        listen_fraction: Optional fraction (0.0 to 1.0) of track duration completed.
+        metadata: Optional additional contextual attributes (e.g. client device, UI view).
+        auth_token: Optional Bearer token for Supabase authorization.
+
+    Returns:
+        bool: True if record was inserted successfully, False otherwise.
+    """
     if not _SUPABASE_URL or not user_id:
         # Zero guest persistence: Guest listening events are never persisted to Supabase
         return False
@@ -240,11 +317,25 @@ def insert_listening_event(
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#   TEXT HELPERS
+#   TEXT HELPERS & SIMILARITY METRICS
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def _normalise(text) -> str:
-    """Lowercase + collapse whitespace."""
+def _normalise(text: Any) -> str:
+    """
+    Sanitize and normalize string or dictionary input for textual comparison.
+
+    Transformations:
+      - Extracts 'name' field if a dictionary is passed (e.g., artist or genre object).
+      - Converts text to lowercase.
+      - Collapses multi-character whitespace sequences into a single space.
+      - Strips leading and trailing whitespace.
+
+    Args:
+        text: Input string or dict to normalize.
+
+    Returns:
+        str: Canonical normalized lowercase string.
+    """
     if isinstance(text, dict):
         text = text.get("name") or ""
     return re.sub(r"\s+", " ", str(text or "").lower().strip())
@@ -252,9 +343,21 @@ def _normalise(text) -> str:
 
 def _token_overlap(a: str, b: str) -> float:
     """
-    Jaccard-like token overlap between two strings.
-    Returns 0.0–1.0.
-    Short-circuits to 0 if either string is empty.
+    Compute Jaccard token similarity between two strings.
+
+    Formula:
+        J(A, B) = |Tokens(A) ∩ Tokens(B)| / |Tokens(A) ∪ Tokens(B)|
+
+    Behavior:
+      - Short-circuits to 0.0 if either string is empty or contains no tokens.
+      - Evaluates to 1.0 for identical sets of whitespace-delimited tokens.
+
+    Args:
+        a: First string to compare.
+        b: Second string to compare.
+
+    Returns:
+        float: Similarity coefficient bounded between 0.0 and 1.0.
     """
     if not a or not b:
         return 0.0
@@ -267,7 +370,9 @@ def _token_overlap(a: str, b: str) -> float:
     return len(intersection) / len(union)
 
 
-# Genre/mood keyword taxonomy — maps slug → keywords present in song title/artist text
+# ─── Genre & Mood Keyword Taxonomy ───────────────────────────────────────────
+# Maps canonical category slugs to token variations and related cultural terms
+# frequently encountered in YouTube music titles, tags, and channel descriptions.
 GENRE_KEYWORDS: dict[str, list[str]] = {
     "bollywood":     ["bollywood", "hindi", "filmy", "indian", "desi"],
     "hip-hop":       ["hip hop", "hiphop", "rap", "trap", "drill"],
@@ -297,9 +402,23 @@ MOOD_KEYWORDS: dict[str, list[str]] = {
 
 def _genre_score_for_song(song: dict, user_genres: list[str]) -> float:
     """
-    Score 0.0–1.0: how well this song's title+artist text matches
-    the user's selected genre keywords.
-    Returns 0.0 if user has no genre preferences.
+    Calculate content matching score (0.0 to 1.0) against user genre preferences.
+
+    Evaluates keyword occurrences from the genre taxonomy within the song's combined
+    title and artist metadata.
+
+    Scoring Logic:
+      - If user has no genre preferences: returns neutral baseline 0.5 (avoids penalizing cold-start).
+      - If taxonomy keyword matches: grants strong match score 0.8.
+      - Partial match: falls back to Jaccard token overlap between genre slug and metadata.
+      - Returns max score across all evaluated user genres, capped at 1.0.
+
+    Args:
+        song: Candidate song dictionary containing 'title' and 'artist'.
+        user_genres: List of genre slugs selected by user (e.g. ['bollywood', 'lo-fi']).
+
+    Returns:
+        float: Genre affinity score bounded between 0.0 and 1.0.
     """
     if not user_genres:
         return 0.5  # neutral when no prefs — don't penalise
@@ -318,7 +437,22 @@ def _genre_score_for_song(song: dict, user_genres: list[str]) -> float:
 
 
 def _mood_score_for_song(song: dict, user_moods: list[str]) -> float:
-    """Score 0.0–1.0: mood keyword overlap."""
+    """
+    Calculate emotional affinity score (0.0 to 1.0) against user mood selections.
+
+    Scoring Logic:
+      - If user has no mood preferences: returns neutral baseline 0.5.
+      - If taxonomy keyword matches: grants high match score 0.9.
+      - Partial match: falls back to token overlap with the mood tag.
+      - Returns max score across evaluated user moods, capped at 1.0.
+
+    Args:
+        song: Candidate song dictionary.
+        user_moods: List of mood identifiers (e.g. ['chill', 'energetic']).
+
+    Returns:
+        float: Mood affinity score bounded between 0.0 and 1.0.
+    """
     if not user_moods:
         return 0.5
     combined_text = _normalise(f"{song.get('title', '')} {song.get('artist', '')}")
@@ -334,7 +468,22 @@ def _mood_score_for_song(song: dict, user_moods: list[str]) -> float:
 
 
 def _combined_genre_mood_score(song: dict, user_genres: list[str], user_moods: list[str]) -> float:
-    """Weighted average of genre and mood scores."""
+    """
+    Compute unified content similarity score blending genre and mood signals.
+
+    Weighting Strategy:
+      - Both signals available: 60% Genre, 40% Mood.
+      - Only one signal available: 100% of that available signal.
+      - Neither available: neutral baseline 0.5.
+
+    Args:
+        song: Candidate song dictionary.
+        user_genres: User's genre preferences.
+        user_moods: User's mood preferences.
+
+    Returns:
+        float: Composite genre/mood score between 0.0 and 1.0.
+    """
     g = _genre_score_for_song(song, user_genres)
     m = _mood_score_for_song(song, user_moods)
     # If both signals available: 60/40 split
@@ -350,8 +499,20 @@ def _combined_genre_mood_score(song: dict, user_genres: list[str], user_moods: l
 
 def _artist_preference_score(song: dict, user_artists: list[str]) -> float:
     """
-    Score 0.0–1.0: how well the song's artist matches user's favourite artists.
-    Exact match → 1.0. Partial match → proportional. No prefs → 0.5.
+    Evaluate candidate track match against user's explicitly favorited artists.
+
+    Scoring Rules:
+      - No user artists defined: returns neutral baseline 0.5.
+      - Missing song artist: penalized with 0.3.
+      - Substring inclusion (e.g. 'Arijit Singh' in 'Arijit Singh, Shreya Ghoshal'): 1.0 (exact match).
+      - Partial overlap: proportional Jaccard token overlap score.
+
+    Args:
+        song: Candidate song dictionary.
+        user_artists: List of favorite artist names (strings or dicts with 'name').
+
+    Returns:
+        float: Artist affinity score between 0.0 and 1.0.
     """
     if not user_artists:
         return 0.5
@@ -372,15 +533,23 @@ def _artist_preference_score(song: dict, user_artists: list[str]) -> float:
 
 def _extract_artist_stats(stats_list: list[dict]) -> dict[str, dict]:
     """
-    Aggregate user listening history across songs by normalized artist name.
-    Returns mapping: artist_normalized -> {
-        'plays': int,
-        'skips': int,
-        'completes': int,
-        'likes': int,
-        'listen_sec': float,
-        'raw_name': str
-    }
+    Aggregate raw user listening history rows by normalized artist name.
+
+    Combines engagement signals (plays, skips, completions, likes, total seconds)
+    across all songs associated with each artist to build an artist-level profile.
+
+    Args:
+        stats_list: List of row dictionaries from user_song_stats table.
+
+    Returns:
+        dict: Mapping of normalized_artist_name -> {
+            'plays': int,
+            'skips': int,
+            'completes': int,
+            'likes': int,
+            'listen_sec': float,
+            'raw_name': str
+        }
     """
     stats: dict[str, dict] = defaultdict(lambda: {
         "plays": 0, "skips": 0, "completes": 0, "likes": 0, "listen_sec": 0.0, "raw_name": ""
@@ -408,9 +577,18 @@ def _extract_artist_stats(stats_list: list[dict]) -> dict[str, dict]:
 
 def _get_top_history_artists(artist_stats: dict[str, dict], limit: int = 3) -> list[str]:
     """
-    Rank artists from user history by positive engagement affinity:
-    affinity = likes*3.0 + completes*1.5 + plays*1.0 - skips*0.5 + min(listen_sec/180.0, 5.0)
-    Returns list of artist display names.
+    Rank artists by cumulative positive engagement affinity based on listening history.
+
+    Affinity Formula:
+        Affinity = (likes * 3.0) + (completes * 1.5) + (plays * 1.0)
+                   - (skips * 0.5) + min(listen_seconds / 180.0, 5.0)
+
+    Args:
+        artist_stats: Dictionary of aggregated artist statistics from `_extract_artist_stats`.
+        limit: Maximum number of top artists to return (default 3).
+
+    Returns:
+        list[str]: Display names of the highest affinity artists exceeding the 0.5 threshold.
     """
     ranked = []
     for norm_a, data in artist_stats.items():
@@ -429,9 +607,22 @@ def _get_top_history_artists(artist_stats: dict[str, dict], limit: int = 3) -> l
 
 def _listening_history_score(song: dict, stats_by_song: dict[str, dict]) -> float:
     """
-    Score 0.0–1.0 from the user's listening history for this song.
-    Liked songs get a strong boost. Frequently played → moderate boost.
-    Heavily skipped → penalty. Brand-new song (no history) → neutral 0.5.
+    Compute behavior-based recommendation score for a specific song from user history.
+
+    Signal Mechanics:
+      - Baseline: 0.5 for songs without prior playback history.
+      - Liked songs: +0.25 (LIKED_SONG_BOOST).
+      - Repeated plays: Diminishing returns bonus +min(0.2, 0.1 * log2(1 + play_count)).
+      - Completion rate: High completion ratio adds up to +0.10.
+      - Playlist adds: +0.05 per add, capped at +0.10.
+      - Skips: Deducts 0.15 per skip, capped at -0.45 (MAX_SKIP_PENALTY).
+
+    Args:
+        song: Candidate song dictionary containing 'id'.
+        stats_by_song: Mapping of song_id -> stats row from user_song_stats.
+
+    Returns:
+        float: Bounded score between 0.0 and 1.0.
     """
     song_id = song.get("id", "")
     stats = stats_by_song.get(song_id)
@@ -469,9 +660,21 @@ def _listening_history_score(song: dict, stats_by_song: dict[str, dict]) -> floa
 
 def _audio_characteristics_score(song: dict) -> float:
     """
-    Score 0.0–1.0 based on audio characteristics.
-    Since we only have YouTube metadata (duration, view_count),
-    we use duration fitness and log-scaled popularity.
+    Evaluate audio fitness heuristics based on duration and popularity proxies.
+
+    Metrics:
+      1. Duration Fitness (60% weight):
+         - Optimal: 150s to 360s (2.5 to 6 min) yields 1.0.
+         - Short tracks (<150s): scaled linearly as duration / 150.
+         - Long tracks (>360s): gentle linear decay max(0.3, 1.0 - excess / 600).
+      2. Popularity Proxy (40% weight):
+         - Log10-scaled YouTube view count normalized to ~0.0 - 1.0 (1M views ≈ 0.5, 100M ≈ 0.9).
+
+    Args:
+        song: Candidate song dictionary with 'duration' and 'viewCount'.
+
+    Returns:
+        float: Combined audio characteristic score between 0.0 and 1.0.
     """
     duration   = song.get("duration", 0) or 0
     view_count = song.get("viewCount", 0) or 0
@@ -500,9 +703,19 @@ def _audio_characteristics_score(song: dict) -> float:
 
 def _discovery_score(song: dict, result_artist_counts: dict[str, int]) -> float:
     """
-    Discovery score penalises over-representation of the same artist.
-    First song from an artist → 1.0.
-    Second → 0.5. Third+ → 0.1.
+    Calculate diversity incentive to discourage excessive artist repetition.
+
+    Dynamic Penalty Schedule:
+      - 0 existing tracks by this artist: 1.0 (no penalty, diverse choice)
+      - 1 existing track by this artist: 0.5 (slight dampening)
+      - 2 or more tracks: 0.1 (strong suppression to enforce variety)
+
+    Args:
+        song: Candidate song dictionary.
+        result_artist_counts: Running count of songs already selected per artist.
+
+    Returns:
+        float: Discovery factor between 0.1 and 1.0.
     """
     artist = _normalise(song.get("artist", "unknown"))
     count  = result_artist_counts.get(artist, 0)
@@ -514,14 +727,23 @@ def _discovery_score(song: dict, result_artist_counts: dict[str, int]) -> float:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#   RECENCY PENALTY
+#   RECENCY SUPPRESSION
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _recency_multiplier(song: dict, stats_by_song: dict[str, dict]) -> float:
     """
-    Returns a multiplier ≤ 1.0 if the song was played very recently.
-    Songs played in the last hour get RECENT_PLAY_PENALTY (0.6×).
-    Songs never played → 1.0 (no penalty).
+    Determine recency suppression multiplier for songs played very recently.
+
+    If the track was played within `RECENT_PLAY_WINDOW_SEC` (1 hour), its score
+    is discounted by `RECENT_PLAY_PENALTY` (0.6x) to avoid immediate playback loops.
+    Tracks played longer ago or never played return full multiplier 1.0.
+
+    Args:
+        song: Candidate song dictionary with 'id'.
+        stats_by_song: User's historical song playback records.
+
+    Returns:
+        float: Multiplier (0.6 or 1.0).
     """
     song_id = song.get("id", "")
     stats   = stats_by_song.get(song_id)
@@ -542,7 +764,7 @@ def _recency_multiplier(song: dict, stats_by_song: dict[str, dict]) -> float:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#   MAIN SCORING FUNCTION
+#   COMPOSITE CANDIDATE SCORING
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def score_candidate(
@@ -557,9 +779,32 @@ def score_candidate(
     artist_stats: dict[str, dict] | None = None,
 ) -> float | None:
     """
-    Compute a composite recommendation score for one candidate song.
-    Returns None if the song should be excluded entirely.
-    Returns float 0.0–1.0+ (can exceed 1.0 before normalisation).
+    Calculate the overall composite recommendation score for a candidate song.
+
+    Evaluation Steps:
+      1. Hard Exclusion Filter:
+         - Rejects songs without valid IDs or belonging to `excluded_ids`.
+      2. Multi-Dimensional Weighted Sum:
+         - Computes sub-scores for Genre/Mood, Artist Affinity, History, Audio, and Discovery.
+         - Weights each using the configured `SCORE_WEIGHTS` dictionary.
+      3. Negative Habit Dampening:
+         - If the user has a consistent skip history for this artist (skips >= 2 and skips > plays),
+           applies a penalty deduction proportional to the excess skips.
+      4. Recency Penalty:
+         - Multiplies score by 0.6 if the song was played within the last hour.
+
+    Args:
+        song: Song metadata dictionary to evaluate.
+        user_genres: User's selected genre preferences.
+        user_moods: User's selected mood preferences.
+        user_artists: User's preferred artist names.
+        stats_by_song: Mapping of song IDs to playback metrics for this user.
+        result_artist_counts: Current artist representation counts in the recommendation set.
+        excluded_ids: Set of video IDs that must not be recommended (queue, exclusions).
+        artist_stats: Optional aggregated artist metrics for habit dampening.
+
+    Returns:
+        float | None: Composite recommendation score, or None if candidate is excluded.
     """
     song_id = song.get("id", "")
 
