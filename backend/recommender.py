@@ -848,17 +848,35 @@ def score_candidate(
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#   CANDIDATE FETCHING (via yt-dlp)
+#   CANDIDATE FETCHING & SEARCH QUERY FORMULATION (via yt-dlp)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _fetch_candidates_ytdlp(query: str, limit: int = MAX_CANDIDATES) -> list[dict]:
     """
-    Fetch candidate songs from YouTube via yt-dlp flat extraction.
-    Applies the same duration filter as /api/browse (1–10 min).
-    Returns a list of song dicts.
+    Extract candidate songs from YouTube using yt-dlp flat playlist extraction.
+
+    Performance & Caching:
+      - Caches search responses in `_candidate_cache` for `CACHE_TTL_SEC` (10 minutes)
+        to prevent redundant network traffic and avoid YouTube IP rate limiting.
+      - Uses lazy import of `yt_dlp` so that unit test environments without yt-dlp
+        can run purely algorithmic scoring tests without failure.
+
+    Filtering Criteria:
+      - Minimum duration: 60 seconds (excludes shorts, preview clips, and ads).
+      - Maximum duration: 600 seconds (10 minutes; excludes extended podcasts/mixes).
+      - Extracts thumbnail fallback chain (best available image down to mqdefault).
+
+    Args:
+        query: YouTube search string.
+        limit: Maximum candidates to parse (default 40).
+
+    Returns:
+        list[dict]: Array of standardized song objects with id, title, artist,
+                    thumbnailUrl, duration, and viewCount.
     """
     cache_key = f"reco:{query}"
     now = time.time()
+    # Check in-memory TTL candidate cache
     if cache_key in _candidate_cache:
         cached_songs, cached_at = _candidate_cache[cache_key]
         if now - cached_at < CACHE_TTL_SEC:
@@ -867,8 +885,10 @@ def _fetch_candidates_ytdlp(query: str, limit: int = MAX_CANDIDATES) -> list[dic
     try:
         import yt_dlp  # imported lazily — not available in unit tests
 
+        # Extract flat metadata to avoid downloading audio or resolving full stream formats
         ydl_opts = {"extract_flat": "in_playlist", "quiet": True, "no_warnings": True}
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            # Over-fetch 3x to ensure sufficient candidates after duration filtering
             info = ydl.extract_info(f"ytsearch{limit * 3}:{query}", download=False)
             entries = info.get("entries", []) or []
 
@@ -878,6 +898,7 @@ def _fetch_candidates_ytdlp(query: str, limit: int = MAX_CANDIDATES) -> list[dic
                 continue
             vid_id   = entry.get("id")
             duration = entry.get("duration") or 0
+            # Enforce 1 min to 10 min track boundaries
             if not vid_id or duration < 60 or duration > 600:
                 continue
             thumbnail = f"https://i.ytimg.com/vi/{vid_id}/mqdefault.jpg"
@@ -910,12 +931,27 @@ def _build_query_from_prefs(
     current_song: dict | None,
 ) -> str:
     """
-    Build a yt-dlp search query that covers the user's tastes.
-    Prioritises the current song's artist, then user artists, then genres.
+    Synthesize an optimal YouTube search query aligned with user context and tastes.
+
+    Priority Order for Query Construction:
+      1. Current playing track's artist (for immediate acoustic continuity).
+      2. Up to 2 favorite artists from user onboarding or top listening history.
+      3. Primary user mood mapped to intent keywords (e.g. 'chill' -> 'chill vibes').
+      4. Primary user genre mapped to search suffix (e.g. 'bollywood' -> 'hindi bollywood songs').
+      5. Cold-Start Fallback: "trending songs official music video india" if no tastes provided.
+
+    Args:
+        user_genres: User's genre preferences.
+        user_artists: User's artist preferences.
+        user_moods: User's mood preferences.
+        current_song: Currently playing song dictionary (if available).
+
+    Returns:
+        str: Composed YouTube search string truncated to max 5 tokens.
     """
     parts: list[str] = []
 
-    # Current song context: find similar songs by the same artist
+    # Current song context: prioritize finding tracks related to the active playing artist
     if current_song:
         ca = (current_song.get("artist") or "").strip()
         if ca and ca.lower() not in ("unknown artist", ""):
@@ -928,7 +964,7 @@ def _build_query_from_prefs(
         if a and a not in parts:
             parts.append(a)
 
-    # Mood keyword
+    # Mood keyword mapping
     mood_map = {
         "chill": "chill vibes", "happy": "upbeat happy",
         "sad": "emotional sad", "romantic": "romantic love",
@@ -938,7 +974,7 @@ def _build_query_from_prefs(
         kw = mood_map.get(mood.lower(), mood)
         parts.append(kw)
 
-    # Genre suffix
+    # Genre suffix mapping for localized audio discovery
     genre_suffix_map = {
         "bollywood": "hindi bollywood songs",
         "pop": "pop songs official",
@@ -952,7 +988,7 @@ def _build_query_from_prefs(
         parts.append(suffix)
 
     if not parts:
-        # Cold start: generic trending fallback
+        # Cold start fallback for guest users without preferences
         parts = ["trending songs official music video india"]
 
     query = " ".join(parts[:5])
@@ -960,7 +996,7 @@ def _build_query_from_prefs(
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#   PUBLIC API
+#   PUBLIC RECOMMENDATION API
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def get_next_recommendations(
@@ -975,20 +1011,35 @@ def get_next_recommendations(
     auth_token: str | None = None,
 ) -> list[dict]:
     """
-    Return up to `limit` recommended songs for the autoplay queue.
+    Generate up to `limit` personalized recommended songs for autoplay queues.
+
+    Pipeline Architecture:
+      1. Listening History Ingestion:
+         - Retrieves past 200 interaction rows from Supabase (safe against failure).
+         - Aggregates artist statistics and extracts top affinity artists.
+      2. Effective Taste Derivation:
+         - Merges user's explicitly selected artists with high-affinity history artists.
+      3. Candidate Pool Seeding:
+         - Seeds candidate set with user's previously liked songs or repeatedly completed songs.
+         - Fetches candidates from YouTube using synthesized queries from effective tastes.
+         - Expands pool with secondary queries if total candidate count is low (< 2 * limit).
+      4. Dynamic Greedy Diversified Selection (MMR-Style):
+         - Iteratively scores remaining candidates and selects the highest scorer.
+         - Enforces `ARTIST_DIVERSITY_CAP` (max 2 songs per artist in the result set).
+         - Dynamically applies `_discovery_score` penalties to prevent artist monopoly.
 
     Args:
-        user_id:      Authenticated Supabase user ID, or None for guests.
-        user_genres:  User's onboarding genre slugs (e.g. ['bollywood', 'pop']).
-        user_moods:   User's mood preferences (e.g. ['chill', 'romantic']).
+        user_id: Authenticated Supabase user ID, or None for guest sessions.
+        user_genres: User's onboarding genre slugs (e.g. ['bollywood', 'pop']).
+        user_moods: User's mood preferences (e.g. ['chill', 'romantic']).
         user_artists: User's favourite artist names.
         current_song: The song currently playing (dict with id, title, artist).
-        exclude_ids:  Song IDs to exclude (recently played, current queue, etc.).
-        limit:        Max songs to return.
-        auth_token:   Supabase JWT for fetching user history.
+        exclude_ids: Song IDs to exclude (recently played, current queue, etc.).
+        limit: Max songs to return (capped at 20).
+        auth_token: Optional Supabase JWT for authenticated history retrieval.
 
     Returns:
-        Sorted list of song dicts, best recommendation first.
+        list[dict]: Ranked list of song dicts, best recommendation first.
     """
     limit = min(limit, 20)  # hard cap to avoid abuse
 
@@ -1054,6 +1105,7 @@ def get_next_recommendations(
 
         for idx, song in enumerate(remaining):
             artist_key = _normalise(song.get("artist", "unknown"))
+            # Respect hard diversity cap per artist
             if chosen_artist_counts[artist_key] >= ARTIST_DIVERSITY_CAP:
                 continue
 
@@ -1072,6 +1124,7 @@ def get_next_recommendations(
                 best_idx = idx
 
         if best_idx == -1:
+            # Fallback if remaining candidates all hit artist caps
             if not results and remaining:
                 fallback_song = remaining.pop(0)
                 results.append(fallback_song)
@@ -1101,8 +1154,20 @@ def get_similar_songs(
     auth_token: str | None = None,
 ) -> list[dict]:
     """
-    Return songs similar to `current_song`.
-    Uses the song's artist name as primary query signal.
+    Retrieve songs acoustically and thematically similar to `current_song`.
+
+    Builds a targeted query utilizing the current track's artist and key title tokens,
+    then executes the diversified ranking pipeline scoped to that musical aesthetic.
+
+    Args:
+        current_song: Reference song dictionary with 'id', 'title', and 'artist'.
+        user_id: Authenticated user ID (or None for guest).
+        exclude_ids: List of song IDs to exclude from results.
+        limit: Maximum similar songs to return (default 10).
+        auth_token: Optional Supabase JWT.
+
+    Returns:
+        list[dict]: Ranked list of similar track dictionaries.
     """
     artist = (current_song.get("artist") or "").strip()
     title  = (current_song.get("title")  or "").strip()
@@ -1134,17 +1199,32 @@ def get_home_sections(
     auth_token: str | None = None,
 ) -> dict:
     """
-    Build personalized home screen sections.
-    Returns a dict with section names mapped to song lists.
+    Construct multi-section personalized music recommendations for the home screen.
 
-    Sections:
-        made_for_you  — hybrid mix based on all user prefs
-        because_you   — per-artist "because you listen to X" sections (up to 2)
-        discover_more — exploration songs (genre-diverse, new artists)
+    Generated Sections:
+      1. `made_for_you`: Hybrid personalized mix blending all user onboarding tastes and history.
+      2. `because_you`: Up to 2 per-artist sections showcasing deep cuts by user's top favorite artists.
+      3. `discover_more`: Exploration section featuring genres outside the user's immediate selection.
+
+    Args:
+        user_id: Authenticated Supabase user ID (or None for guest).
+        user_genres: User's selected genres.
+        user_moods: User's selected moods.
+        user_artists: User's favorite artists.
+        limit_per_section: Maximum songs per section shelf (default 10).
+        auth_token: Optional Supabase JWT.
+
+    Returns:
+        dict: {
+            "made_for_you": list[dict],
+            "because_you": list[{"artist": str, "songs": list[dict]}],
+            "discover_more": list[dict],
+            "has_personalisation": bool
+        }
     """
     all_exclude: set[str] = set()
 
-    # Section 1: Made for You
+    # ── Section 1: Made for You (Hybrid Personalized Mix) ────────────────────
     made_for_you = get_next_recommendations(
         user_id=user_id,
         user_genres=user_genres,
@@ -1157,7 +1237,7 @@ def get_home_sections(
     )
     all_exclude.update(s["id"] for s in made_for_you)
 
-    # Section 2: Because You Listened To [Artist] (top 2 fav artists)
+    # ── Section 2: Because You Listened To [Artist] ──────────────────────────
     effective_home_artists = list(user_artists or [])
     if not effective_home_artists and user_id:
         stats_list = fetch_user_song_stats(user_id, auth_token)
@@ -1183,8 +1263,8 @@ def get_home_sections(
             because_you_sections.append({"artist": artist, "songs": songs})
             all_exclude.update(s["id"] for s in songs)
 
-    # Section 3: Discover More (diversified — genres other than user's top)
-    # Use a broad discovery query to surface variety
+    # ── Section 3: Discover More (Diversified Exploration) ────────────────────
+    # Select genres outside user's current selections to encourage musical discovery
     all_genres = list(GENRE_KEYWORDS.keys())
     discover_genres = [g for g in all_genres if g not in (user_genres or [])][:3]
     discover = get_next_recommendations(
@@ -1204,4 +1284,5 @@ def get_home_sections(
         "discover_more":       discover,
         "has_personalisation": bool(user_id and (user_genres or effective_home_artists)),
     }
+
 
